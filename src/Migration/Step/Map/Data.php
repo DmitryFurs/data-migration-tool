@@ -5,18 +5,22 @@
  */
 namespace Migration\Step\Map;
 
+use Migration\App\Progress;
+use Migration\App\ProgressBar\LogLevelProcessor;
 use Migration\App\Step\StageInterface;
-use Migration\Config;
-use Migration\Reader\MapInterface;
+use Migration\Logger\Logger;
+use Migration\Logger\Manager as LogManager;
 use Migration\Reader\Map;
 use Migration\Reader\MapFactory;
-use Migration\ResourceModel;
+use Migration\Reader\MapInterface;
+use Migration\RecordTransformer;
+use Migration\RecordTransformerFactory;
+use Migration\ResourceModel\DirectCopy;
 use Migration\ResourceModel\Document;
 use Migration\ResourceModel\Record;
-use Migration\App\ProgressBar;
-use Migration\App\Progress;
-use Migration\Logger\Manager as LogManager;
-use Migration\Logger\Logger;
+use Migration\ResourceModel\Destination;
+use Migration\ResourceModel\RecordFactory;
+use Migration\ResourceModel\Source;
 
 /**
  * Class Data
@@ -26,88 +30,83 @@ use Migration\Logger\Logger;
 class Data implements StageInterface
 {
     /**
-     * @var ResourceModel\Source
+     * @var Source
      */
-    protected $source;
+    private $source;
 
     /**
-     * @var ResourceModel\Destination
+     * @var Destination
      */
-    protected $destination;
+    private $destination;
 
     /**
-     * @var ResourceModel\RecordFactory
+     * @var RecordFactory
      */
-    protected $recordFactory;
+    private $recordFactory;
 
     /**
      * @var Map
      */
-    protected $map;
+    private $map;
 
     /**
-     * @var \Migration\RecordTransformerFactory
+     * @var RecordTransformerFactory
      */
-    protected $recordTransformerFactory;
+    private $recordTransformerFactory;
 
     /**
-     * @var ProgressBar\LogLevelProcessor
+     * @var LogLevelProcessor
      */
-    protected $progressBar;
+    private $progressBar;
 
     /**
      * Progress instance, saves the state of the process
      *
      * @var Progress
      */
-    protected $progress;
+    private $progress;
 
     /**
      * @var Logger
      */
-    protected $logger;
-
-    /**
-     * @var Config
-     */
-    protected $config;
-
-    /**
-     * @var bool
-     */
-    protected $copyDirectly;
+    private $logger;
 
     /**
      * @var Helper
      */
-    protected $helper;
+    private $helper;
 
     /**
-     * @param ProgressBar\LogLevelProcessor $progressBar
-     * @param ResourceModel\Source $source
-     * @param ResourceModel\Destination $destination
-     * @param ResourceModel\RecordFactory $recordFactory
-     * @param \Migration\RecordTransformerFactory $recordTransformerFactory
+     * @var DirectCopy
+     */
+    private $directCopy;
+
+    /**
+     * @param LogLevelProcessor $progressBar
+     * @param Source $source
+     * @param Destination $destination
+     * @param RecordFactory $recordFactory
+     * @param RecordTransformerFactory $recordTransformerFactory
      * @param MapFactory $mapFactory
      * @param Progress $progress
      * @param Logger $logger
-     * @param Config $config
      * @param Helper $helper
+     * @param DirectCopy $directCopy
      *
      * @SuppressWarnings(CyclomaticComplexity)
      * @SuppressWarnings(PHPMD.ExcessiveParameterList)
      */
     public function __construct(
-        ProgressBar\LogLevelProcessor $progressBar,
-        ResourceModel\Source $source,
-        ResourceModel\Destination $destination,
-        ResourceModel\RecordFactory $recordFactory,
-        \Migration\RecordTransformerFactory $recordTransformerFactory,
+        LogLevelProcessor $progressBar,
+        Source $source,
+        Destination $destination,
+        RecordFactory $recordFactory,
+        RecordTransformerFactory $recordTransformerFactory,
         MapFactory $mapFactory,
         Progress $progress,
         Logger $logger,
-        Config $config,
-        Helper $helper
+        Helper $helper,
+        DirectCopy $directCopy
     ) {
         $this->source = $source;
         $this->destination = $destination;
@@ -117,9 +116,8 @@ class Data implements StageInterface
         $this->progressBar = $progressBar;
         $this->progress = $progress;
         $this->logger = $logger;
-        $this->config = $config;
-        $this->copyDirectly = (bool)$this->config->getOption('direct_document_copy');
         $this->helper = $helper;
+        $this->directCopy = $directCopy;
     }
 
     /**
@@ -144,9 +142,9 @@ class Data implements StageInterface
             }
             $this->destination->clearDocument($destinationName);
             $this->logger->debug('migrating', ['table' => $sourceDocName]);
-            $recordTransformer = $this->getRecordTransformer($sourceDocument, $destDocument);
-            $doCopy = $recordTransformer === null && $this->copyDirectly;
-            if ($doCopy && $this->isCopiedDirectly($sourceDocument, $destDocument)) {
+
+            $isCopiedDirectly = $this->directCopy->execute($sourceDocument, $destDocument, $this->map);
+            if ($isCopiedDirectly) {
                 $this->progressBar->start(1, LogManager::LOG_LEVEL_DEBUG);
             } else {
                 $pageNumber = 0;
@@ -154,6 +152,8 @@ class Data implements StageInterface
                     ceil($this->source->getRecordsCount($sourceDocName) / $this->source->getPageSize($sourceDocName)),
                     LogManager::LOG_LEVEL_DEBUG
                 );
+
+                $recordTransformer = $this->getRecordTransformer($sourceDocument, $destDocument);
                 while (!empty($items = $this->source->getRecords($sourceDocName, $pageNumber))) {
                     $pageNumber++;
                     $destinationRecords = $destDocument->getRecords();
@@ -188,107 +188,19 @@ class Data implements StageInterface
      *
      * @param Document $sourceDocument
      * @param Document $destDocument
-     * @return \Migration\RecordTransformer
+     * @return RecordTransformer
      */
     public function getRecordTransformer(Document $sourceDocument, Document $destDocument)
     {
-        if ($this->canJustCopy($sourceDocument, $destDocument)) {
-            return null;
-        }
-        /** @var \Migration\RecordTransformer $recordTransformer */
+        /** @var RecordTransformer $recordTransformer */
         $recordTransformer = $this->recordTransformerFactory->create(
             [
                 'sourceDocument' => $sourceDocument,
                 'destDocument' => $destDocument,
-                'mapReader' => $this->map
+                'mapReader' => $this->map,
             ]
         );
-        $recordTransformer->init();
-        return $recordTransformer;
-    }
 
-    /**
-     * Can just copy
-     *
-     * @param Document $sourceDocument
-     * @param Document $destDocument
-     * @return bool
-     */
-    public function canJustCopy(Document $sourceDocument, Document $destDocument)
-    {
-        return $this->haveEqualStructure($sourceDocument, $destDocument)
-            && !$this->hasHandlers($sourceDocument, MapInterface::TYPE_SOURCE)
-            && !$this->hasHandlers($destDocument, MapInterface::TYPE_DEST);
-    }
-
-    /**
-     * Have equal structure
-     *
-     * @param Document $sourceDocument
-     * @param Document $destDocument
-     * @return string bool
-     */
-    protected function haveEqualStructure(Document $sourceDocument, Document $destDocument)
-    {
-        $diff = array_diff_key(
-            $sourceDocument->getStructure()->getFields(),
-            $destDocument->getStructure()->getFields()
-        );
-        return empty($diff);
-    }
-
-    /**
-     * Is copied directly
-     *
-     * @param Document $sourceDocument
-     * @param Document $destinationDocument
-     * @return bool
-     */
-    protected function isCopiedDirectly(Document $sourceDocument, Document $destinationDocument)
-    {
-        if (!$this->copyDirectly) {
-            return;
-        }
-        $result = true;
-        $schema = $this->config->getSource()['database']['name'];
-        /** @var \Magento\Framework\DB\Select $select */
-        $select = $this->source->getAdapter()->getSelect();
-        $select->from($this->source->addDocumentPrefix($sourceDocument->getName()), '*', $schema);
-        try {
-            $this->destination->getAdapter()->insertFromSelect(
-                $select,
-                $this->destination->addDocumentPrefix($destinationDocument->getName()),
-                array_keys($sourceDocument->getStructure()->getFields())
-            );
-        } catch (\Exception $e) {
-            $this->copyDirectly = false;
-            $this->logger->warning(
-                'Document ' . $sourceDocument->getName() . ' can not be copied directly because of error: '
-                . $e->getMessage()
-            );
-            $result = false;
-        }
-
-        return $result;
-    }
-
-    /**
-     * Has handlers
-     *
-     * @param Document $document
-     * @param string $type
-     * @return bool
-     */
-    protected function hasHandlers(Document $document, $type)
-    {
-        $result = false;
-        foreach (array_keys($document->getStructure()->getFields()) as $fieldName) {
-            $handlerConfig = $this->map->getHandlerConfigs($document->getName(), $fieldName, $type);
-            if (!empty($handlerConfig)) {
-                $result = true;
-                break;
-            }
-        }
-        return $result;
+        return $recordTransformer->init();
     }
 }
